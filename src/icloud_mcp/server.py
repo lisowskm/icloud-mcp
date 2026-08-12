@@ -320,7 +320,8 @@ async def email_list_messages(
     context,
     folder: str = "INBOX",
     limit: int = 50,
-    unread_only: bool = False
+    unread_only: bool = False,
+    include_body: bool = False
 ) -> list | dict:
     """
     List messages in a folder.
@@ -329,11 +330,12 @@ async def email_list_messages(
         folder: Folder name (default: INBOX). Common folder names: INBOX, Sent Messages, Drafts, Trash, Archive
         limit: Maximum number of messages to return (default: 50)
         unread_only: Only return unread messages (default: False)
+        include_body: Include message body content (default: False, headers only)
 
     Note: The Sent folder may be named "Sent Messages", "Sent", or "Sent Items" depending on your email provider.
     """
     try:
-        return await email_module.list_messages(context, folder, limit, unread_only)
+        return await email_module.list_messages(context, folder, limit, unread_only, include_body)
     except AuthenticationError as e:
         return {"error": str(e), "status": 401}
     except Exception as e:
@@ -395,7 +397,8 @@ async def email_search(
     context,
     query: str,
     folder: str = "INBOX",
-    limit: int = 50
+    limit: int = 50,
+    include_body: bool = False
 ) -> list | dict:
     """
     Search for messages by text query.
@@ -404,9 +407,10 @@ async def email_search(
         query: Search text (searches subject and from fields)
         folder: Folder name (default: INBOX)
         limit: Maximum number of results (default: 50)
+        include_body: Include message body content (default: False, headers only)
     """
     try:
-        return await email_module.search_messages(context, query, folder, limit)
+        return await email_module.search_messages(context, query, folder, limit, include_body)
     except AuthenticationError as e:
         return {"error": str(e), "status": 401}
     except Exception as e:

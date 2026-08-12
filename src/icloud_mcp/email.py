@@ -74,6 +74,98 @@ def _decode_mime_header(header_value: str) -> str:
     return ' '.join(result)
 
 
+def _is_attachment(part) -> bool:
+    """Return True if a MIME part is an attachment (not message body)."""
+    if part.get_content_disposition() == "attachment":
+        return True
+    if part.get_filename():
+        return True
+    return False
+
+
+def _html_to_text(html_body: str) -> str:
+    """Convert an HTML body to readable Markdown text (html2text)."""
+    try:
+        import html2text
+
+        h = html2text.HTML2Text()
+        h.body_width = 0  # no hard line wrapping
+        return h.handle(html_body).strip()
+    except Exception as _e:
+        # Fallback: crude tag stripping if html2text is unavailable
+        import re
+
+        text = re.sub(r'<[^>]+>', ' ', html_body)
+        return re.sub(r'\s+', ' ', text).strip()
+
+
+def _extract_body_text(msg) -> str:
+    """Extract readable text/plain content from a message.
+
+    Binary payloads are never returned as body text:
+    - Non-text MIME types (e.g. application/pdf, image/*) are skipped
+    - text/* parts that are attachments (Content-Disposition: attachment or
+      a filename) are skipped, even if their declared type is text/plain
+    - PDF magic bytes are a last-resort safety net for mislabelled parts
+
+    If no text/plain body exists, text/html is converted to Markdown text.
+    """
+    # Single-part messages: only treat text/* payloads as body content
+    if not msg.is_multipart():
+        if msg.get_content_maintype() != "text":
+            return ""
+        if _is_attachment(msg):
+            return ""
+        payload = msg.get_payload(decode=True)
+        if payload is None:
+            return ""
+        try:
+            text = payload.decode('utf-8', errors='ignore')
+        except Exception as _e:
+            return ""
+        if msg.get_content_type() == "text/html":
+            return _html_to_text(text)
+        return text
+
+    # Multipart messages: prefer the first text/plain body part
+    for part in msg.walk():
+        if part.get_content_type() != "text/plain":
+            continue
+        if _is_attachment(part):
+            continue
+        try:
+            payload = part.get_payload(decode=True)
+        except Exception as _e:
+            continue
+        if payload is None:
+            continue
+        if payload.startswith(b'%PDF') or payload.startswith(b'PK\x03\x04'):
+            # Mislabelled binary (PDF / ZIP) declared as text/plain
+            continue
+        try:
+            return payload.decode('utf-8', errors='ignore')
+        except Exception as _e:
+            continue
+
+    # Fallback: convert the first text/html body part to Markdown text
+    for part in msg.walk():
+        if part.get_content_type() != "text/html":
+            continue
+        if _is_attachment(part):
+            continue
+        try:
+            payload = part.get_payload(decode=True)
+        except Exception as _e:
+            continue
+        if payload is None:
+            continue
+        try:
+            return _html_to_text(payload.decode('utf-8', errors='ignore'))
+        except Exception as _e:
+            continue
+    return ""
+
+
 async def list_folders(context: Context) -> List[Dict[str, Any]]:
     """
     List all email folders/mailboxes.
@@ -110,7 +202,8 @@ async def list_messages(
     context: Context,
     folder: str = "INBOX",
     limit: int = 50,
-    unread_only: bool = False
+    unread_only: bool = False,
+    include_body: bool = False
 ) -> List[Dict[str, Any]]:
     """
     List messages in a folder.
@@ -119,6 +212,7 @@ async def list_messages(
         folder: Folder name (default: INBOX)
         limit: Maximum number of messages to return
         unread_only: Only return unread messages
+        include_body: Include message body content (default: False, headers only)
 
     Returns:
     """
@@ -143,15 +237,21 @@ async def list_messages(
         if not message_ids:
             return []
 
-        # Fetch full message body to extract body_text
-        response = client.fetch(message_ids, [b'FLAGS', b'BODY.PEEK[]'])
+        # Fetch messages; fetch full body only when include_body is requested
+        if include_body:
+            response = client.fetch(message_ids, [b'FLAGS', b'BODY.PEEK[]'])
+        else:
+            response = client.fetch(message_ids, [b'FLAGS', b'BODY.PEEK[HEADER]'])
 
         result = []
         for msg_id, data in response.items():
             try:
                 # Try multiple possible keys for the message body
                 raw_email = None
-                for key in [b'BODY[]', 'BODY[]', b'RFC822', 'RFC822', b'BODY.PEEK[]']:
+                possible_keys = [b'BODY[]', 'BODY[]', b'RFC822', 'RFC822', b'BODY.PEEK[]']
+                if not include_body:
+                    possible_keys = ['BODY[HEADER]', b'BODY[HEADER]', 'BODY.PEEK[HEADER]', b'BODY.PEEK[HEADER]']
+                for key in possible_keys:
                     if key in data:
                         raw_email = data[key]
                         break
@@ -163,31 +263,22 @@ async def list_messages(
 
                 # Extract body_text
                 body_text = ""
-                if msg.is_multipart():
-                    for part in msg.walk():
-                        content_type = part.get_content_type()
-                        if content_type == "text/plain":
-                            try:
-                                body_text = part.get_payload(decode=True).decode('utf-8', errors='ignore')
-                                break
-                            except Exception as _e:
-                                pass
-                else:
-                    try:
-                        body_text = msg.get_payload(decode=True).decode('utf-8', errors='ignore')
-                    except Exception as _e:
-                        pass
+                if include_body:
+                    body_text = _extract_body_text(msg)
 
-                result.append({
+                item = {
                     "id": str(msg_id),
                     "subject": _decode_mime_header(msg.get('Subject', '')),
                     "from": _decode_mime_header(msg.get('From', '')),
                     "to": _decode_mime_header(msg.get('To', '')),
                     "date": msg.get('Date', ''),
                     "flags": [flag.decode() if isinstance(flag, bytes) else flag for flag in data.get(b'FLAGS', data.get('FLAGS', []))],
-                    "folder": folder,
-                    "body_text": body_text
-                })
+                    "folder": folder
+                }
+                if include_body:
+                    item["body_text"] = body_text
+
+                result.append(item)
             except Exception as _e:
                 continue
 
@@ -263,27 +354,15 @@ async def get_message(
 
         if include_body:
             # Extract body
-            body_text = ""
+            body_text = _extract_body_text(msg)
             body_html = ""
-
-            if msg.is_multipart():
+            if full_html:
                 for part in msg.walk():
-                    content_type = part.get_content_type()
-                    if content_type == "text/plain":
-                        try:
-                            body_text = part.get_payload(decode=True).decode('utf-8', errors='ignore')
-                        except Exception as _e:
-                            pass
-                    elif content_type == "text/html" and full_html:
+                    if part.get_content_type() == "text/html":
                         try:
                             body_html = part.get_payload(decode=True).decode('utf-8', errors='ignore')
                         except Exception as _e:
                             pass
-            else:
-                try:
-                    body_text = msg.get_payload(decode=True).decode('utf-8', errors='ignore')
-                except Exception as _e:
-                    pass
 
             result["body_text"] = body_text
             if full_html:
@@ -366,27 +445,15 @@ async def get_messages(
 
             if include_body:
                 # Extract body
-                body_text = ""
+                body_text = _extract_body_text(msg)
                 body_html = ""
-
-                if msg.is_multipart():
+                if full_html:
                     for part in msg.walk():
-                        content_type = part.get_content_type()
-                        if content_type == "text/plain":
-                            try:
-                                body_text = part.get_payload(decode=True).decode('utf-8', errors='ignore')
-                            except Exception as _e:
-                                pass
-                        elif content_type == "text/html" and full_html:
+                        if part.get_content_type() == "text/html":
                             try:
                                 body_html = part.get_payload(decode=True).decode('utf-8', errors='ignore')
                             except Exception as _e:
                                 pass
-                else:
-                    try:
-                        body_text = msg.get_payload(decode=True).decode('utf-8', errors='ignore')
-                    except Exception as _e:
-                        pass
 
                 result["body_text"] = body_text
                 if full_html:
@@ -408,7 +475,8 @@ async def search_messages(
     context: Context,
     query: str,
     folder: str = "INBOX",
-    limit: int = 50
+    limit: int = 50,
+    include_body: bool = False
 ) -> List[Dict[str, Any]]:
     """
     Search for messages by text query.
@@ -417,6 +485,7 @@ async def search_messages(
         query: Search text (searches subject and from fields)
         folder: Folder name (default: INBOX)
         limit: Maximum number of results
+        include_body: Include message body content (default: False, headers only)
 
     Returns:
         List of matching messages
@@ -442,15 +511,21 @@ async def search_messages(
             if not message_ids:
                 return []
 
-            # Fetch full message body to extract body_text
-            response = client.fetch(message_ids, [b'FLAGS', b'BODY.PEEK[]'])
+            # Fetch messages; fetch full body only when include_body is requested
+            if include_body:
+                response = client.fetch(message_ids, [b'FLAGS', b'BODY.PEEK[]'])
+            else:
+                response = client.fetch(message_ids, [b'FLAGS', b'BODY.PEEK[HEADER]'])
 
             result = []
             for msg_id, data in response.items():
                 try:
                     # Try multiple possible keys for the message body
                     raw_email = None
-                    for key in [b'BODY[]', 'BODY[]', b'RFC822', 'RFC822', b'BODY.PEEK[]']:
+                    possible_keys = [b'BODY[]', 'BODY[]', b'RFC822', 'RFC822', b'BODY.PEEK[]']
+                    if not include_body:
+                        possible_keys = ['BODY[HEADER]', b'BODY[HEADER]', 'BODY.PEEK[HEADER]', b'BODY.PEEK[HEADER]']
+                    for key in possible_keys:
                         if key in data:
                             raw_email = data[key]
                             break
@@ -462,31 +537,22 @@ async def search_messages(
 
                     # Extract body_text
                     body_text = ""
-                    if msg.is_multipart():
-                        for part in msg.walk():
-                            content_type = part.get_content_type()
-                            if content_type == "text/plain":
-                                try:
-                                    body_text = part.get_payload(decode=True).decode('utf-8', errors='ignore')
-                                    break
-                                except Exception as _e:
-                                    pass
-                    else:
-                        try:
-                            body_text = msg.get_payload(decode=True).decode('utf-8', errors='ignore')
-                        except Exception as _e:
-                            pass
+                    if include_body:
+                        body_text = _extract_body_text(msg)
 
-                    result.append({
+                    item = {
                         "id": str(msg_id),
                         "subject": _decode_mime_header(msg.get('Subject', '')),
                         "from": _decode_mime_header(msg.get('From', '')),
                         "to": _decode_mime_header(msg.get('To', '')),
                         "date": msg.get('Date', ''),
                         "flags": [flag.decode() if isinstance(flag, bytes) else flag for flag in data.get(b'FLAGS', data.get('FLAGS', []))],
-                        "folder": folder,
-                        "body_text": body_text
-                    })
+                        "folder": folder
+                    }
+                    if include_body:
+                        item["body_text"] = body_text
+
+                    result.append(item)
                 except Exception as _e:
                     continue
 
@@ -508,15 +574,21 @@ async def search_messages(
             if not message_ids:
                 return []
 
-            # Fetch full messages with body
-            response = client.fetch(message_ids, [b'FLAGS', b'BODY.PEEK[]'])
+            # Fetch messages; fetch full body only when include_body is requested
+            if include_body:
+                response = client.fetch(message_ids, [b'FLAGS', b'BODY.PEEK[]'])
+            else:
+                response = client.fetch(message_ids, [b'FLAGS', b'BODY.PEEK[HEADER]'])
 
             all_messages = []
             for msg_id, data in response.items():
                 try:
                     # Try multiple possible keys for the message body
                     raw_email = None
-                    for key in [b'BODY[]', 'BODY[]', b'RFC822', 'RFC822', b'BODY.PEEK[]']:
+                    possible_keys = [b'BODY[]', 'BODY[]', b'RFC822', 'RFC822', b'BODY.PEEK[]']
+                    if not include_body:
+                        possible_keys = ['BODY[HEADER]', b'BODY[HEADER]', 'BODY.PEEK[HEADER]', b'BODY.PEEK[HEADER]']
+                    for key in possible_keys:
                         if key in data:
                             raw_email = data[key]
                             break
@@ -528,31 +600,22 @@ async def search_messages(
 
                     # Extract body_text
                     body_text = ""
-                    if msg.is_multipart():
-                        for part in msg.walk():
-                            content_type = part.get_content_type()
-                            if content_type == "text/plain":
-                                try:
-                                    body_text = part.get_payload(decode=True).decode('utf-8', errors='ignore')
-                                    break
-                                except Exception as _e:
-                                    pass
-                    else:
-                        try:
-                            body_text = msg.get_payload(decode=True).decode('utf-8', errors='ignore')
-                        except Exception as _e:
-                            pass
+                    if include_body:
+                        body_text = _extract_body_text(msg)
 
-                    all_messages.append({
+                    item = {
                         "id": str(msg_id),
                         "subject": _decode_mime_header(msg.get('Subject', '')),
                         "from": _decode_mime_header(msg.get('From', '')),
                         "to": _decode_mime_header(msg.get('To', '')),
                         "date": msg.get('Date', ''),
                         "flags": [flag.decode() if isinstance(flag, bytes) else flag for flag in data.get(b'FLAGS', data.get('FLAGS', []))],
-                        "folder": folder,
-                        "body_text": body_text
-                    })
+                        "folder": folder
+                    }
+                    if include_body:
+                        item["body_text"] = body_text
+
+                    all_messages.append(item)
                 except Exception as _e:
                     continue
 
